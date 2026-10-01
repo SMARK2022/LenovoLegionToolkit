@@ -14,6 +14,16 @@ public class AutomationSettings() : AbstractSettings<AutomationSettings.Automati
         public bool IsEnabled { get; set; }
 
         public List<AutomationPipeline> Pipelines { get; set; } = [];
+
+        // When true, AC adapter connect/disconnect events are debounced before
+        // reaching pipelines, suppressing spurious rapid oscillation (e.g. faulty
+        // AC telemetry reporting 1-3s false disconnect/reconnect pulses).
+        public bool IsPowerAdapterDebounceEnabled { get; set; } = true;
+
+        // Seconds the adapter state must remain stable before an adapter
+        // connect/disconnect event is forwarded to pipelines.
+        // 0 = re-validate state immediately without waiting.
+        public int PowerAdapterDebounceSeconds { get; set; } = 5;
     }
 
     protected override AutomationSettingsStore Default => new()

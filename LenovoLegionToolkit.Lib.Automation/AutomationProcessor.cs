@@ -39,10 +39,10 @@ public class AutomationProcessor(
     // Debounce state for AC adapter connect/disconnect oscillation.
     // Guards against spurious rapid AC telemetry pulses (e.g. faulty power
     // drivers reporting 1-3s disconnect/reconnect bursts) reaching pipelines.
+    // Window and enable switch are configurable via AutomationSettingsStore.
     private readonly object _powerAdapterDebounceSync = new();
     private CancellationTokenSource? _powerAdapterDebounceCts;
     private PowerAdapterStatus? _lastConfirmedAdapterStatus;
-    private static readonly TimeSpan PowerAdapterDebounceWindow = TimeSpan.FromSeconds(5);
 
     public bool IsEnabled => settings.Store.IsEnabled;
 
@@ -275,8 +275,12 @@ public class AutomationProcessor(
         // Debounce rapid adapter-state oscillation before it reaches pipelines.
         // A spurious pulse (e.g. 1-3s false disconnect) is swallowed entirely here;
         // a real plug/unplug is only delayed by the debounce window.
-        if (args.PowerStateEvent == PowerStateEvent.StatusChange && args.PowerAdapterStateChanged)
+        // Controlled by AutomationSettingsStore.IsPowerAdapterDebounceEnabled /
+        // PowerAdapterDebounceSeconds.
+        if (args.PowerStateEvent == PowerStateEvent.StatusChange && args.PowerAdapterStateChanged && settings.Store.IsPowerAdapterDebounceEnabled)
         {
+            var debounceWindow = TimeSpan.FromSeconds(Math.Max(0, settings.Store.PowerAdapterDebounceSeconds));
+
             CancellationToken token;
             lock (_powerAdapterDebounceSync)
             {
@@ -288,7 +292,7 @@ public class AutomationProcessor(
 
             try
             {
-                await Task.Delay(PowerAdapterDebounceWindow, token).ConfigureAwait(false);
+                await Task.Delay(debounceWindow, token).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
