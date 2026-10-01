@@ -9,6 +9,7 @@ using LenovoLegionToolkit.Lib.Automation.Pipeline.Triggers;
 using LenovoLegionToolkit.Lib.Automation.Utils;
 using LenovoLegionToolkit.Lib.Controllers.GodMode;
 using LenovoLegionToolkit.Lib.Listeners;
+using LenovoLegionToolkit.Lib.System;
 using LenovoLegionToolkit.Lib.Utils;
 using NeoSmart.AsyncLock;
 
@@ -34,6 +35,14 @@ public class AutomationProcessor(
 
     private List<AutomationPipeline> _pipelines = [];
     private CancellationTokenSource? _cts;
+
+    // Debounce state for AC adapter connect/disconnect oscillation.
+    // Guards against spurious rapid AC telemetry pulses (e.g. faulty power
+    // drivers reporting 1-3s disconnect/reconnect bursts) reaching pipelines.
+    private readonly object _powerAdapterDebounceSync = new();
+    private CancellationTokenSource? _powerAdapterDebounceCts;
+    private PowerAdapterStatus? _lastConfirmedAdapterStatus;
+    private static readonly TimeSpan PowerAdapterDebounceWindow = TimeSpan.FromSeconds(5);
 
     public bool IsEnabled => settings.Store.IsEnabled;
 
@@ -263,6 +272,61 @@ public class AutomationProcessor(
 
     private async void PowerStateListener_Changed(object? sender, PowerStateListener.ChangedEventArgs args)
     {
+        // Debounce rapid adapter-state oscillation before it reaches pipelines.
+        // A spurious pulse (e.g. 1-3s false disconnect) is swallowed entirely here;
+        // a real plug/unplug is only delayed by the debounce window.
+        if (args.PowerStateEvent == PowerStateEvent.StatusChange && args.PowerAdapterStateChanged)
+        {
+            CancellationToken token;
+            lock (_powerAdapterDebounceSync)
+            {
+                _powerAdapterDebounceCts?.Cancel();
+                _powerAdapterDebounceCts?.Dispose();
+                _powerAdapterDebounceCts = new CancellationTokenSource();
+                token = _powerAdapterDebounceCts.Token;
+            }
+
+            try
+            {
+                await Task.Delay(PowerAdapterDebounceWindow, token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // Superseded by a newer adapter event within the debounce window.
+                return;
+            }
+
+            if (token.IsCancellationRequested)
+                return;
+
+            PowerAdapterStatus currentStatus;
+            try
+            {
+                currentStatus = await Power.IsPowerAdapterConnectedAsync().ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Log.Instance.Trace($"Failed to query adapter state after debounce; suppressing event.", ex);
+                return;
+            }
+
+            // Initialize the confirmed baseline on first use. Since the incoming event
+            // carries powerAdapterStateChanged=true, the pre-event stable state was the
+            // opposite of the state reported at event time.
+            _lastConfirmedAdapterStatus ??= currentStatus == PowerAdapterStatus.Connected
+                ? PowerAdapterStatus.Disconnected
+                : PowerAdapterStatus.Connected;
+
+            if (_lastConfirmedAdapterStatus == currentStatus)
+            {
+                Log.Instance.Trace($"Adapter state stable after debounce; suppressing spurious event. [status={currentStatus}]");
+                return;
+            }
+
+            Log.Instance.Trace($"Adapter state changed after debounce. [old={_lastConfirmedAdapterStatus}, new={currentStatus}]");
+            _lastConfirmedAdapterStatus = currentStatus;
+        }
+
         var e = new PowerStateAutomationEvent(args.PowerStateEvent, args.PowerAdapterStateChanged);
         await ProcessEvent(e).ConfigureAwait(false);
     }
